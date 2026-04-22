@@ -1,6 +1,6 @@
 import asyncio
 import calendar
-import html  # НОВОЕ: Для безопасной работы с текстом
+import html
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
@@ -8,6 +8,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
     ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.exceptions import TelegramBadRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import database
 
@@ -51,19 +52,16 @@ def add_months(sourcedate, months):
     return sourcedate.replace(year=year, month=month, day=day)
 
 
-# --- ГЕНЕРАТОР КАРУСЕЛИ (С НОВЫМ ДИЗАЙНОМ) ---
+# --- ГЕНЕРАТОР КАРУСЕЛИ ---
 def get_sub_message(subs, index):
     total = len(subs)
     index = max(0, min(index, total - 1))
-
     sub = subs[index]
     sub_id, name, category, period, price, date, remind, link = sub
 
-    # Безопасный вывод имени (если там есть скобки или знаки)
     safe_name = html.escape(name)
     remind_text = f"за {remind} дн." if remind > 0 else "выключено 🔕"
 
-    # НОВЫЙ ДИЗАЙН: Используем тег <blockquote> для создания "Карточки"
     text = (f"📑 <b>Подписка {index + 1} из {total}</b>\n\n"
             f"<blockquote><b>{safe_name}</b>\n"
             f"📁 Категория: {category}\n"
@@ -87,7 +85,6 @@ def get_sub_message(subs, index):
             InlineKeyboardButton(text=f"• {index + 1} •", callback_data="ignore"),
             InlineKeyboardButton(text="Вперед ➡️", callback_data=f"page_{next_idx}")
         ])
-
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -100,8 +97,7 @@ async def start_handler(message: types.Message, state: FSMContext):
         "Я твой личный <b>Менеджер Подписок</b> 🍿\n"
         "Помогу не забыть об оплате и покажу, куда уходят твои деньги.\n\n"
         "<i>Выбери действие в меню ниже:</i>",
-        reply_markup=main_keyboard,
-        parse_mode="HTML"
+        reply_markup=main_keyboard, parse_mode="HTML"
     )
 
 
@@ -265,7 +261,12 @@ async def page_handler(callback: types.CallbackQuery):
     index = int(callback.data.split('_')[1])
     subs = database.get_subscriptions(callback.from_user.id)
     text, kb = get_sub_message(subs, index)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass  # Игнорируем ошибку, если пользователь быстро листает и текст не успел измениться
+
     await callback.answer()
 
 
@@ -277,8 +278,7 @@ async def ignore_callback(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("renew_"))
 async def renew_sub_handler(callback: types.CallbackQuery):
     parts = callback.data.split('_')
-    sub_id = int(parts[1])
-    index = int(parts[2])
+    sub_id, index = int(parts[1]), int(parts[2])
     sub_data = database.get_subscription_period_and_date(sub_id)
     if not sub_data: return
     period, date_str, name = sub_data
@@ -299,8 +299,7 @@ async def renew_sub_handler(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_sub_handler(callback: types.CallbackQuery):
     parts = callback.data.split('_')
-    sub_id = int(parts[1])
-    index = int(parts[2])
+    sub_id, index = int(parts[1]), int(parts[2])
     database.delete_subscription(sub_id)
     await callback.answer("Удалено! 🗑")
     subs = database.get_subscriptions(callback.from_user.id)
@@ -364,40 +363,176 @@ async def save_new_value_handler(message: types.Message, state: FSMContext):
     await btn_list_subs(message)
 
 
-# --- ТЕКСТОВАЯ СТАТИСТИКА (С ПРОГРЕСС БАРАМИ) ---
+# ==========================================
+# --- МНОГОУРОВНЕВАЯ СТАТИСТИКА (4 Вкладки) ---
+# ==========================================
+
+def get_stats_keyboard(current_tab):
+    # Теперь вкладки расположены в два ряда (2x2)
+    buttons = []
+    tabs_row1 = {"main": "📊 Общая", "cats": "📁 Разделы"}
+    tabs_row2 = {"months": "🗓 По месяцам", "soon": "📅 Ближайшие"}
+
+    row1, row2 = [], []
+    for key, name in tabs_row1.items():
+        btn_text = f"🔹 {name}" if key == current_tab else name
+        row1.append(InlineKeyboardButton(text=btn_text, callback_data=f"statstab_{key}"))
+    for key, name in tabs_row2.items():
+        btn_text = f"🔹 {name}" if key == current_tab else name
+        row2.append(InlineKeyboardButton(text=btn_text, callback_data=f"statstab_{key}"))
+
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
+
+
 @dp.message(F.text == "📊 Статистика")
 async def btn_stats(message: types.Message):
-    subs = database.get_advanced_statistics(message.from_user.id)
-    if not subs: return await message.answer("Статистика пуста. 📭")
+    await show_statistics_tab(message.from_user.id, "main", message)
 
-    total_monthly, total_yearly = 0.0, 0.0
-    categories = {}
 
-    for category, period, price in subs:
-        monthly_cost = price if period == "Ежемесячно" else (price / 12 if period == "Ежегодно" else 0)
-        total_monthly += monthly_cost
-        total_yearly += price * 12 if period == "Ежемесячно" else (price if period == "Ежегодно" else 0)
-        if period != "Разово": categories[category] = categories.get(category, 0) + monthly_cost
+@dp.callback_query(F.data.startswith("statstab_"))
+async def stat_tabs_handler(callback: types.CallbackQuery):
+    tab = callback.data.split('_')[1]
+    await show_statistics_tab(callback.from_user.id, tab, callback.message, is_edit=True)
+    await callback.answer()
 
-    text = (f"📊 <b>Твоя финансовая сводка:</b>\n\n"
-            f"💸 Уходит в месяц: <b>{total_monthly:.2f} руб.</b>\n"
-            f"💳 Уходит в год: <b>{total_yearly:.2f} руб.</b>\n\n"
-            f"📉 <b>Расходы по категориям:</b>\n\n")
 
-    cat_total = sum(categories.values())
+async def show_statistics_tab(user_id, tab, message: types.Message, is_edit=False):
+    subs = database.get_subscriptions(user_id)
+    if not subs:
+        text = "У тебя пока нет подписок. Статистика пуста. 📭"
+        if is_edit:
+            try:
+                await message.edit_text(text)
+            except TelegramBadRequest:
+                pass
+        else:
+            await message.answer(text)
+        return
 
-    # Сортируем и рисуем красивые прогресс-бары для категорий
-    for cat, cost in sorted(categories.items(), key=lambda item: item[1], reverse=True):
-        percent = (cost / cat_total * 100) if cat_total > 0 else 0
-        filled = int(percent / 10)
-        empty = 10 - filled
-        bar = "█" * filled + "░" * empty
+    text = ""
 
-        text += f"▪️ {cat}: <b>{cost:.2f} руб.</b>\n"
-        text += f"<code>[{bar}] {percent:.0f}%</code>\n\n"
+    if tab == "main":
+        total_monthly, total_yearly = 0.0, 0.0
+        categories = {}
+        for sub in subs:
+            _, _, cat, period, price, _, _, _ = sub
+            monthly_cost = price if period == "Ежемесячно" else (price / 12 if period == "Ежегодно" else 0)
+            total_monthly += monthly_cost
+            total_yearly += price * 12 if period == "Ежемесячно" else (price if period == "Ежегодно" else 0)
+            if period != "Разово": categories[cat] = categories.get(cat, 0) + monthly_cost
 
-    await message.answer(text, parse_mode="HTML")
+        text = (f"📊 <b>Общая финансовая сводка:</b>\n\n"
+                f"💸 Уходит в месяц: <b>{total_monthly:.2f} руб.</b>\n"
+                f"💳 Уходит в год: <b>{total_yearly:.2f} руб.</b>\n\n"
+                f"📉 <b>Доли категорий:</b>\n\n")
 
+        cat_total = sum(categories.values())
+        for cat, cost in sorted(categories.items(), key=lambda item: item[1], reverse=True):
+            percent = (cost / cat_total * 100) if cat_total > 0 else 0
+            filled = int(percent / 10)
+            empty = 10 - filled
+            bar = "█" * filled + "░" * empty
+            text += f"▪️ {cat}: <b>{cost:.2f} руб.</b>\n<code>[{bar}] {percent:.0f}%</code>\n\n"
+
+    elif tab == "cats":
+        categories_dict = {}
+        for sub in subs:
+            _, name, cat, period, price, _, _, _ = sub
+            if cat not in categories_dict: categories_dict[cat] = []
+            categories_dict[cat].append((name, price, period))
+
+        text = "📁 <b>Детализация по разделам:</b>\n\n"
+        for cat, items in categories_dict.items():
+            text += f"<b>{cat}</b>\n"
+            for name, price, period in items:
+                period_short = "мес" if period == "Ежемесячно" else "год" if period == "Ежегодно" else "раз"
+                text += f" ├ {html.escape(name)} — {price}₽/{period_short}\n"
+            text += "\n"
+
+    elif tab == "months":
+        today = datetime.now().date()
+        months_dict = {}
+
+        for i in range(12):
+            m = add_months(today.replace(day=1), i)
+            months_dict[(m.year, m.month)] = 0.0
+
+        for sub in subs:
+            _, _, _, period, price, date_str, _, _ = sub
+            try:
+                pay_date = datetime.strptime(date_str, "%d.%m.%Y").date()
+            except ValueError:
+                continue
+
+            current_pay = pay_date
+            for _ in range(60):
+                if (current_pay.year, current_pay.month) in months_dict:
+                    months_dict[(current_pay.year, current_pay.month)] += price
+
+                if period == "Ежемесячно":
+                    current_pay = add_months(current_pay, 1)
+                elif period == "Ежегодно":
+                    current_pay = add_months(current_pay, 12)
+                else:
+                    break
+
+                if current_pay > add_months(today, 12): break
+
+        month_names = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
+        text = "🗓 <b>Прогноз расходов на год вперед:</b>\n\n"
+        max_val = max(months_dict.values()) if months_dict.values() else 0
+
+        for (y, m), val in months_dict.items():
+            month_str = f"{month_names[m - 1]} {y}"
+            if max_val > 0 and val > 0:
+                percent = val / max_val * 100
+                filled = int(percent / 10)
+                bar = "█" * filled + "░" * (10 - filled)
+                text += f"<b>{month_str}</b> — {val:.0f}₽\n<code>[{bar}]</code>\n"
+            else:
+                text += f"<b>{month_str}</b> — 0₽\n"
+
+    elif tab == "soon":
+        today = datetime.now().date()
+        upcoming = []
+        for sub in subs:
+            _, name, _, period, price, date_str, _, _ = sub
+            if period == "Разово": continue
+            try:
+                pay_date = datetime.strptime(date_str, "%d.%m.%Y").date()
+                if pay_date <= today + timedelta(days=30):
+                    days_left = (pay_date - today).days
+                    upcoming.append((days_left, pay_date, name, price))
+            except ValueError:
+                pass
+
+        upcoming.sort(key=lambda x: x[0])
+        text = "📅 <b>Календарь списаний (на 30 дней):</b>\n\n"
+        if not upcoming:
+            text += "<i>В ближайший месяц списаний не предвидится! 🎉</i>"
+        else:
+            for days_left, pay_date, name, price in upcoming:
+                if days_left < 0:
+                    time_text = "⚠️ Просрочено!"
+                elif days_left == 0:
+                    time_text = "🔥 <b>СЕГОДНЯ!</b>"
+                elif days_left == 1:
+                    time_text = "Завтра"
+                else:
+                    time_text = f"Через {days_left} дн."
+                text += f"▪️ <b>{html.escape(name)}</b> ({price} руб.)\n   └ {pay_date.strftime('%d.%m.%Y')} — <i>{time_text}</i>\n\n"
+
+    kb = get_stats_keyboard(tab)
+    if is_edit:
+        try:
+            await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except TelegramBadRequest:
+            pass  # Игнорируем ошибку двойного клика по одной и той же вкладке
+    else:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+# ==========================================
 
 # --- НАПОМИНАНИЯ ---
 async def check_reminders():
